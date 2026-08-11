@@ -1,0 +1,17 @@
+# Session cookies — never commit
+.env
+
+# Saved browser login profile
+.glean_profile/
+
+# Captured payloads may contain prompt text
+captured_payloads/
+server.log
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Cached Glean frontend bundles (large, regenerable)
+.bundle_cache/
