@@ -221,7 +221,9 @@ change.
 | `GLEAN_MAX_OUTPUT_TOKENS` | Output limit advertised, default `8192` |
 | `GLEAN_TIMEZONE_OFFSET` | Minutes, default `420` |
 | `GLEAN_TIMEOUT` | Upstream timeout in seconds, default `300` |
-| `LOG_LEVEL` | e.g. `DEBUG` |
+| `GLEAN_CUMULATIVE_STREAM` | Treat stream chunks as whole-message resends; leave `false` |
+| `GLEAN_PROXY_API_KEY` | Optional shared secret clients must send to this proxy; empty disables the check |
+| `LOG_LEVEL` | e.g. `DEBUG`; an unrecognised value falls back to `INFO` |
 
 ### Setting the context window
 
@@ -368,6 +370,9 @@ python -m uvicorn proxy:app --host 127.0.0.1 --port 8000
 - To reach it from another machine, prefer an SSH tunnel
   (`ssh -L 8000:localhost:8000 user@vm`). Binding `--host 0.0.0.0` exposes an endpoint
   with **no authentication** — anyone who can reach the port can use your Glean account.
+- If you must bind wider, set `GLEAN_PROXY_API_KEY` in `.env` and have the client send it
+  as `Authorization: Bearer <key>` or `x-api-key`. Requests without it get a 401. This is
+  a single shared secret, not real auth, so the tunnel is still the better option.
 
 ## Notes
 

@@ -153,6 +153,68 @@ check_true(
     == [{"name": "ls", "arguments": {}}],
 )
 
+print("\n--- malformed tool markup salvage ---")
+# The opener is right but the closer is borrowed from another dialect, or is
+# missing entirely. The payload is still valid JSON, so the call is recovered
+# rather than delivered to the client as raw markup in assistant text.
+check(
+    "mismatched closing tag recovered",
+    proxy.extract_tool_calls(
+        f'{proxy.TOOL_CALL_OPEN}\n{{"name": "read", "arguments": {{"filePath": "x"}}}}\n</invoke>'
+    ),
+    [{"name": "read", "arguments": {"filePath": "x"}}],
+)
+check(
+    "missing closing tag recovered",
+    proxy.extract_tool_calls(
+        f'{proxy.TOOL_CALL_OPEN}\n{{"name": "read", "arguments": {{"filePath": "x"}}}}'
+    ),
+    [{"name": "read", "arguments": {"filePath": "x"}}],
+)
+check(
+    "two malformed calls recovered in order",
+    [c["arguments"]["filePath"] for c in proxy.extract_tool_calls(
+        f'{proxy.TOOL_CALL_OPEN}\n{{"name": "read", "arguments": {{"filePath": "a"}}}}\n</invoke>\n'
+        f'{proxy.TOOL_CALL_OPEN}\n{{"name": "read", "arguments": {{"filePath": "b"}}}}\n</invoke>'
+    )],
+    ["a", "b"],
+)
+# Brace matching, not a lazy regex: a `}` inside a JSON string must not be
+# mistaken for the end of the object, or nested arguments get truncated.
+check(
+    "brace inside a JSON string",
+    proxy.extract_tool_calls(
+        f'{proxy.TOOL_CALL_OPEN}\n{{"name": "bash", "arguments": {{"command": "echo }}"}}}}\n</invoke>'
+    ),
+    [{"name": "bash", "arguments": {"command": "echo }"}}],
+)
+# The JSON payload here is `"echo \"}\""`: an escaped quote, then a brace that
+# must not be read as the end of the object. Doubling the backslashes again would
+# emit an escaped backslash followed by a bare quote, which is invalid JSON and
+# unparseable by any tier.
+check(
+    "escaped quote then brace",
+    proxy.extract_tool_calls(
+        f'{proxy.TOOL_CALL_OPEN}\n{{"name": "bash", "arguments": {{"command": "echo \\"}}\\""}}}}\n</invoke>'
+    ),
+    [{"name": "bash", "arguments": {"command": 'echo "}"'}}],
+)
+check(
+    "runaway trailing tags do not duplicate the call",
+    proxy.extract_tool_calls(
+        f'{proxy.TOOL_CALL_OPEN}\n{{"name": "read", "arguments": {{"filePath": "x"}}}}\n</invoke>'
+        + "</invoke>" * 50
+    ),
+    [{"name": "read", "arguments": {"filePath": "x"}}],
+)
+check(
+    "well-formed markup still takes the strict path",
+    proxy.extract_tool_calls(
+        f'{proxy.TOOL_CALL_OPEN}\n{{"name": "read", "arguments": {{"filePath": "x"}}}}\n{proxy.TOOL_CALL_CLOSE}'
+    ),
+    [{"name": "read", "arguments": {"filePath": "x"}}],
+)
+
 print("\n--- completion assembly ---")
 comp = proxy._completion("hello", [])
 check("text finish_reason", comp["choices"][0]["finish_reason"], "stop")
@@ -173,15 +235,24 @@ check("markup stripped from content", tool_comp["choices"][0]["message"]["conten
 print("\n--- stream delta handling ---")
 d = proxy.Delta()
 check("incremental chunks", [d.push("Hel"), d.push("lo"), d.push("!")], ["Hel", "lo", "!"])
-d2 = proxy.Delta()
+d2 = proxy.Delta(cumulative=True)
 check(
-    "cumulative chunks de-duplicated",
+    "cumulative chunks de-duplicated (opt-in)",
     [d2.push("Hel"), d2.push("Hello"), d2.push("Hello!")],
     ["Hel", "lo", "!"],
 )
 check("accumulated text", d2.text, "Hello!")
 d3 = proxy.Delta()
 check("repeat ignored", [d3.push("a"), d3.push("a")], ["a", ""])
+
+# Glean's fragments are incremental, so a chunk that happens to prefix the next
+# one is real text, not a resend. Treating it as cumulative dropped the overlap.
+d4 = proxy.Delta()
+check(
+    "prefix-shaped chunks kept whole when incremental (the default)",
+    [d4.push("I"), d4.push("I'll")],
+    ["I", "I'll"],
+)
 
 print("\n--- SSE / NDJSON parsing ---")
 check("sse line", list(proxy._iter_json_objects('data: {"a": 1}')), [{"a": 1}])
@@ -213,6 +284,57 @@ chrono = proxy.build_glean_messages(
     [{"role": "user", "content": "oldest"}, {"role": "user", "content": "newest"}], []
 )
 check("chronological mode still available", chrono[0]["fragments"][0]["text"], "oldest")
+
+print("\n--- model resolution ---")
+# A Claude name must never reach Glean verbatim: it rejects the unknown value by
+# discarding the whole agentConfig, silently re-enabling company retrieval.
+check("glean id passthrough", proxy.resolve_model_set("OPUS_5_MS")[0], "OPUS_5_MS")
+check("glean/ prefix stripped", proxy.resolve_model_set("glean/SONNET_5_MS")[0], "SONNET_5_MS")
+check("suffixed claude name", proxy.resolve_model_set("claude-opus-5-fast"), ("OPUS_5_MS", "FAST"))
+check("base claude name", proxy.resolve_model_set("claude-sonnet-5")[0], "SONNET_5_MS")
+check("dated claude name", proxy.resolve_model_set("claude-opus-4-5-20251101")[0], "OPUS_5_MS")
+check(
+    "longest prefix wins over base name",
+    proxy.resolve_model_set("claude-opus-5-advanced"),
+    ("OPUS_5_MS", "ADVANCED"),
+)
+check(
+    "unknown name falls back to the configured default",
+    proxy.resolve_model_set("gpt-4o")[0],
+    proxy.GLEAN_MODEL_SET_ID,
+)
+
+print("\n--- token estimates ---")
+check("chars to tokens", proxy._estimate_tokens_from_chars(400), 100)
+check("empty text still costs 1", proxy._estimate_tokens(""), 1)
+check(
+    "prompt chars counted from the assembled payload",
+    proxy._prompt_chars({"messages": [
+        {"fragments": [{"text": "abc"}, {}]},
+        {"fragments": [{"text": "de"}]},
+    ]}),
+    5,
+)
+
+usage = proxy._completion("hello there", [], "claude-opus-5-fast", 400)
+check("model echoed back", usage["model"], "claude-opus-5-fast")
+check("prompt tokens reported", usage["usage"]["prompt_tokens"], 100)
+check_true(
+    "total is the sum of both sides",
+    usage["usage"]["total_tokens"]
+    == usage["usage"]["prompt_tokens"] + usage["usage"]["completion_tokens"],
+    str(usage["usage"]),
+)
+
+print("\n--- persona sync with SKILL.md ---")
+# Behaviour otherwise depends on which persona path fired.
+skill = (proxy.ROOT / "coding-agent-backend" / "SKILL.md").read_text(encoding="utf-8")
+skill_body = skill.split("---", 2)[-1].strip()
+check_true(
+    "HARNESS_PROMPT matches the SKILL.md body",
+    skill_body == proxy.HARNESS_PROMPT.strip(),
+    "SKILL.md and HARNESS_PROMPT have diverged",
+)
 
 print()
 if failures:

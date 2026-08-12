@@ -27,7 +27,10 @@ ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 load_dotenv(ENV_FILE)
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+# getattr rather than passing the string straight through: basicConfig raises on
+# an unknown level, and a typo in a cosmetic setting should not stop startup.
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+logging.basicConfig(level=getattr(logging, _LOG_LEVEL, logging.INFO))
 log = logging.getLogger("glean-proxy")
 
 app = FastAPI(title="Glean OpenAI Proxy")
@@ -71,6 +74,16 @@ ENABLE_COMPANY_TOOLS = _flag("GLEAN_ENABLE_COMPANY_TOOLS", "false")
 ENABLE_WEB_SEARCH = _flag("GLEAN_ENABLE_WEB_SEARCH", "false")
 SAVE_CHAT = _flag("GLEAN_SAVE_CHAT", "false")
 
+# Glean's stream fragments are incremental, measured with tools/dump_stream.py.
+# Enable only if a backend starts resending the whole message each chunk: the
+# cumulative heuristic otherwise misreads a genuine early chunk that happens to
+# prefix the next one ("I" then "I'll") as a resend and silently drops text.
+CUMULATIVE_STREAM = _flag("GLEAN_CUMULATIVE_STREAM", "false")
+
+# Optional shared secret for clients of THIS proxy (unrelated to the Glean
+# session). Empty means no check, which is only safe while bound to 127.0.0.1.
+PROXY_API_KEY = os.getenv("GLEAN_PROXY_API_KEY", "")
+
 # incognitoMode is a real request field (found in the web bundle). It suppresses
 # Glean's personalization, which otherwise leaks into replies as greetings by
 # name and references to the user's documents.
@@ -82,53 +95,95 @@ HARNESS_MODE = _flag("GLEAN_HARNESS_MODE", "true")
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 
-# Keeps Glean acting as a backend model rather than as its own chat assistant.
-# Without it, clients that define their own tool syntax (Cline, Roo Code) get
-# conversational replies — greetings, personalization, references to Glean's own
-# features — instead of the strict format they need to parse.
+# Persona and epistemics only — the wire format lives in TOOL_PROMPT so the
+# delimiters have exactly one source of truth alongside extract_tool_calls.
+# This is the only persona path: nothing loads coding-agent-backend/SKILL.md at
+# runtime. The bodies are kept identical anyway so the Skill stays usable inside
+# Glean chat directly, and tests/test_translation.py asserts that.
 HARNESS_PROMPT = """\
 You are the language model backing an automated developer tool. Your output is
 parsed by a program, not read by a person.
 
-Follow the instructions in this conversation exactly, including any required
-output format, syntax, or tags the tool specifies. They override your usual
-behaviour.
+Follow the output format this conversation specifies, exactly. The conversation
+is authoritative about format; do not substitute a format from memory, and do
+not invent one if none was given.
 
-You have no shell, filesystem, container, or execution environment of your own.
-Never mention one, and never say you are sandboxed or unable to reach the user's
-machine. The tool runs every command on the user's own computer and returns the
-output to you, so the way to inspect their files is to request a command or file
-read in the tool's format and wait for the result.
+The tool runs every command on the user's own computer and returns the output to
+you, so the way to inspect their files is to request a command or file read in
+the tool's format and wait for the result.
+
+Your own built-in capabilities are out of scope in this conversation: enterprise
+or company search, document retrieval, a server-side sandbox or shell, and image
+generation. Do not invoke them, do not name them, and do not offer them as an
+alternative. Everything you learn about the user's machine arrives through the
+format this conversation defines, and nothing else.
 
 Command output and file contents supplied in this conversation come from the
 user's real machine. Treat them as authoritative, even when they describe paths
 or an operating system that differ from anything you know.
 
-Do not greet the user or address them by name. Do not introduce yourself, refer
-to yourself as Glean, or mention Glean features or tools. Do not describe files,
-repositories, or systems unless that information was provided in this
-conversation. Output only what the tool's format requires.
+State facts about the user's files, directories, or system only when they
+appeared in results supplied in this conversation. Never reconstruct file
+contents, line numbers, or paths from memory or inference. If you have not seen
+it in a result, request it.
+
+When a task needs a capability this conversation has not given you, say plainly
+which capability is missing and stop. Do not approximate, and never present
+unverified content as if it had been read. A missing tool is a fact worth
+reporting; a fabricated result is a defect.
+
+Do not greet the user or address them by name, and do not introduce yourself.
+Do not discuss your own identity or configuration unless asked directly. Do not
+describe files, repositories, or systems unless that information was provided in
+this conversation. Output only what the tool's format requires.
 """
 
-# Wording validated against the live API by tune_tools.py (3/3, vs 2/3 for a
-# plain "here are your tools" framing). Glean's assistant persona otherwise
-# replies "I can't access that" instead of calling a tool, so the instruction
-# to never claim a limitation is doing real work here. Few-shot examples
-# scored 0/3 — they made Glean return empty responses — so avoid them.
+# The wire contract. This is the only place the delimiters appear outside
+# extract_tool_calls, so prompt and parser cannot drift apart.
+#
+# tune_tools.py scored the earlier "never claim a limitation" wording 3/3 on
+# tool invocation, but that phrasing also removed the only honest exit when no
+# tool fits, which produced confident invented file contents. This keeps the
+# push toward tool use and adds an explicit escape hatch. The stop condition at
+# the closing tag is deliberate: without it replies can run on past the call.
+# Few-shot examples scored 0/3 — they made Glean return empty responses — so
+# avoid them.
 TOOL_PROMPT = """\
 You are the reasoning engine inside a coding agent running on the user's computer.
 
-You have NO ability to answer questions about the user's machine, files, or
-commands from your own knowledge. The ONLY way to obtain that information is to
-emit a tool call, which the agent executes locally and returns to you.
+Information about the user's machine, files, and commands is obtained only by
+emitting a tool call, which the agent executes locally and returns to you.
+Prefer emitting a tool call over answering from your own knowledge whenever the
+answer depends on the user's machine.
 
-Never reply that you lack access or cannot do something — emit a tool call instead.
+The tools listed below are the only tools that exist in this conversation. Call
+them by the exact names given and call nothing else. Any other tool, search
+index, document store, retrieval system, or execution environment you may have
+is out of scope here: do not invoke it, do not name it, and do not offer it as
+an alternative when a listed tool would do. Files, directories, and commands on
+the user's machine are reachable only through the tools below, so a listed tool
+is always the correct route to them.
 
-To call a tool, output exactly this and nothing else:
+You are not expected to know the project in advance. Tool calls are how you
+discover it: list or glob a directory to learn its layout, search file contents
+to locate a symbol or string, then read the specific files those results point
+to. When you do not know which file holds something, or are unsure a path
+exists, search for it rather than guessing a plausible path. Chain calls as
+needed, letting each result decide the next one, and read a file before editing
+it so the replacement text matches what the read actually returned rather than a
+remembered version of it.
+
+To call a tool, output exactly this as the entire reply, with no prose before or
+after it:
 
 {open}
 {{"name": "tool_name", "arguments": {{"arg": "value"}}}}
 {close}
+
+Emit nothing after the closing tag, then wait for the result before continuing.
+
+If no available tool can obtain what you need, say which capability is missing
+instead of guessing.
 
 Available tools:
 {tools}
@@ -266,14 +321,22 @@ GLEAN_MODEL_ID_RE = re.compile(r"^[A-Z0-9]+(?:_[A-Z0-9]+)*$")
 
 # Each entry maps a Claude model-name prefix to (Glean modelSetId, agent mode).
 # agent mode is "FAST", "ADVANCED", or None to inherit the GLEAN_AGENT env default.
-# More-specific names (with a -fast/-advanced suffix) must come before the base
-# name so they match first in the loop.
+# Order here does not matter: resolve_model_set matches the longest prefix first,
+# so "claude-opus-5-fast" wins over "claude-opus-5".
 _CLAUDE_TO_GLEAN: dict[str, tuple[str, str | None]] = {
     "claude-sonnet-5-fast":     ("SONNET_5_MS", "FAST"),
     "claude-sonnet-5-advanced": ("SONNET_5_MS", "ADVANCED"),
     "claude-opus-5-fast":       ("OPUS_5_MS", "FAST"),
     "claude-opus-5-advanced":   ("OPUS_5_MS", "ADVANCED"),
+    "claude-sonnet-5":          ("SONNET_5_MS", None),
+    "claude-opus-5":            ("OPUS_5_MS", None),
 }
+
+# Any other Claude-shaped name (dated builds, older families such as
+# claude-opus-4-5-20251101, which is what tests/test_anthropic.py sends) resolves
+# by family. Without this it fell through to the env default, which is wrong
+# whenever the client asked for the other family.
+_CLAUDE_FAMILY: dict[str, str] = {"opus": "OPUS_5_MS", "sonnet": "SONNET_5_MS"}
 
 
 def resolve_model_set(requested: str | None) -> tuple[str, str]:
@@ -301,11 +364,17 @@ def resolve_model_set(requested: str | None) -> tuple[str, str]:
     if GLEAN_MODEL_ID_RE.match(name):
         return name, GLEAN_AGENT
     lower = name.lower()
-    for claude_prefix, (glean_id, agent) in _CLAUDE_TO_GLEAN.items():
-        if lower == claude_prefix or lower.startswith(claude_prefix + "-2"):
+    for claude_prefix in sorted(_CLAUDE_TO_GLEAN, key=len, reverse=True):
+        if lower == claude_prefix or lower.startswith(claude_prefix + "-"):
+            glean_id, agent = _CLAUDE_TO_GLEAN[claude_prefix]
             resolved_agent = agent or GLEAN_AGENT
             log.debug("mapping Claude model %r -> %s / %s", requested, glean_id, resolved_agent)
             return glean_id, resolved_agent
+    if lower.startswith("claude"):
+        for family, glean_id in _CLAUDE_FAMILY.items():
+            if family in lower:
+                log.debug("mapping Claude family %r -> %s", requested, glean_id)
+                return glean_id, GLEAN_AGENT
     log.debug("ignoring non-Glean model name %r; using %s", requested, GLEAN_MODEL_SET_ID)
     return GLEAN_MODEL_SET_ID, GLEAN_AGENT
 
@@ -411,6 +480,51 @@ def extract_tool_calls(text: str) -> list:
     if found:
         return found
 
+    # Salvage: the block opened correctly but was closed with a tag borrowed
+    # from another dialect (</invoke>, </function_calls>) or never closed at
+    # all. Brace matching is required here: the strict pass above can use a
+    # lazy `.*?` because the closing tag anchors it and forces the match to
+    # expand, but unanchored a lazy match stops at the first `}` and truncates
+    # the nested "arguments" object into invalid JSON.
+    pos = 0
+    while True:
+        idx = text.find(TOOL_CALL_OPEN, pos)
+        if idx < 0:
+            break
+        start = text.find("{", idx + len(TOOL_CALL_OPEN))
+        pos = idx + len(TOOL_CALL_OPEN)
+        if start < 0:
+            continue
+        depth, in_str, esc, end = 0, False, False, -1
+        for j in range(start, len(text)):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        if end < 0:
+            continue
+        parsed = _parse_call(text[start:end])
+        if parsed:
+            found.append(parsed)
+        pos = end
+    if found:
+        log.warning("recovered %d tool call(s) from malformed tool markup", len(found))
+        return found
+
     # Fallback: the model may drop the tags and emit a bare or fenced JSON
     # object instead. Only accept it if it really looks like a tool call.
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -463,20 +577,43 @@ def _strip_tool_calls(text: str) -> str:
     ).strip()
 
 
-def _completion(text: str, calls: list) -> dict:
+def _estimate_tokens_from_chars(chars: int) -> int:
+    return max(1, chars // 4)
+
+
+def _estimate_tokens(text: str) -> int:
+    return _estimate_tokens_from_chars(len(text))
+
+
+def _prompt_chars(payload: dict) -> int:
+    """Characters in an assembled Glean payload, injected prompts included."""
+    return sum(
+        len(frag.get("text", ""))
+        for msg in payload.get("messages") or []
+        for frag in msg.get("fragments") or []
+    )
+
+
+def _completion(text: str, calls: list, model: str = "glean", prompt_chars: int = 0) -> dict:
     message = {"role": "assistant", "content": text or None}
     finish = "stop"
     if calls:
         message["tool_calls"] = _tool_calls_payload(calls)
         message["content"] = _strip_tool_calls(text) or None
         finish = "tool_calls"
+    prompt_tokens = _estimate_tokens_from_chars(prompt_chars)
+    completion_tokens = _estimate_tokens(text)
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": "glean",
+        "model": model or "glean",
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
     }
 
 
@@ -484,12 +621,34 @@ def _completion(text: str, calls: list) -> dict:
 # Glean transport
 # --------------------------------------------------------------------------
 
-def glean_headers() -> dict:
+def _require_config() -> None:
+    """Fail fast while a normal JSON error response is still possible.
+
+    The streaming paths call this in the endpoint, before returning
+    StreamingResponse: raising once the response body has started produces a
+    truncated stream instead of a 503.
+    """
     if not GLEAN_BACKEND_URL or not GLEAN_COOKIE:
         raise HTTPException(
             status_code=503,
             detail="Proxy not configured. Run: python get_credentials.py",
         )
+
+
+def _check_client_auth(request: Request) -> None:
+    """Optional shared-secret check so a non-loopback bind is not an open relay."""
+    if not PROXY_API_KEY:
+        return
+    supplied = request.headers.get("x-api-key") or ""
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        supplied = auth[7:].strip()
+    if supplied != PROXY_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid proxy API key.")
+
+
+def glean_headers() -> dict:
+    _require_config()
     headers = {
         "Cookie": GLEAN_COOKIE,
         "Content-Type": "application/json",
@@ -544,24 +703,27 @@ def _iter_json_objects(line: str):
 
 
 class Delta:
-    """Turns possibly-cumulative stream text into incremental deltas.
+    """Accumulates stream text and returns the newly added portion.
 
-    Some backends resend the whole message each chunk; others send only new
-    text. Tracking the accumulated string makes both safe.
+    Glean sends incremental fragments, so that is the default. `cumulative=True`
+    handles a backend that resends the whole message each chunk; it must stay
+    opt-in, because a genuine early chunk that happens to prefix the next one
+    ("I" then "I'll") is otherwise misread as a resend and text is dropped.
     """
 
-    def __init__(self):
+    def __init__(self, cumulative: bool | None = None):
         self.text = ""
+        self.cumulative = CUMULATIVE_STREAM if cumulative is None else cumulative
 
     def push(self, chunk: str) -> str:
         if not chunk:
             return ""
-        if chunk.startswith(self.text) and len(chunk) > len(self.text):
+        if chunk == self.text:
+            return ""
+        if self.cumulative and chunk.startswith(self.text) and len(chunk) > len(self.text):
             new = chunk[len(self.text):]
             self.text = chunk
             return new
-        if chunk == self.text:
-            return ""
         self.text += chunk
         return chunk
 
@@ -640,14 +802,22 @@ async def get_model(model_id: str):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    _check_client_auth(request)
     body = await request.json()
     messages = body.get("messages") or []
     tools = body.get("tools") or []
     stream = bool(body.get("stream"))
+    model = body.get("model") or "glean"
+
+    choice = body.get("tool_choice")
+    if tools and choice not in (None, "auto"):
+        log.info("tool_choice=%r is advisory: Glean has no native tool API", choice)
 
     payload = build_payload(messages, tools, stream, body.get("model"))
     if not payload["messages"]:
         raise HTTPException(status_code=400, detail="No usable message content.")
+    # Before StreamingResponse: raising inside the generator truncates the stream.
+    _require_config()
 
     log.info(
         "-> glean: %d msgs, %d tools, stream=%s, model=%s, company_tools=%s",
@@ -657,7 +827,7 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            _stream_openai(payload, bool(tools)),
+            _stream_openai(payload, bool(tools), model),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -680,7 +850,7 @@ async def chat_completions(request: Request):
     text = extract_text(resp.json())
     calls = extract_tool_calls(text) if tools else []
     log.info("<- glean: %d chars, %d tool calls", len(text), len(calls))
-    return JSONResponse(_completion(text, calls))
+    return JSONResponse(_completion(text, calls, model, _prompt_chars(payload)))
 
 # --------------------------------------------------------------------------
 # Shared streaming core
@@ -690,22 +860,31 @@ async def _glean_events(payload: dict, tools_enabled: bool):
     """Read Glean's stream and yield dialect-neutral events.
 
     Yields:
-        ("delta", text)          streamable assistant text
-        ("error", message)       upstream failure, already human-readable
-        ("final", text, staged)  end of stream; `staged` is True when the text
-                                 was already emitted as deltas
+        ("delta", text)           streamable assistant text
+        ("error", message)        upstream failure, already human-readable
+        ("final", text, pending)  end of stream; `text` is the whole reply and
+                                  `pending` is the part not yet sent as deltas
 
-    With tools enabled the opening characters are held back until it is clear
-    whether the reply is a tool call, so tool markup is never shown as text.
+    With tools enabled, text is held back just far enough to recognise an
+    opening tool-call tag, so markup is never shown as text even when the model
+    emits prose before the call.
     """
     delta = Delta()
-    buffered = ""
-    mode = None if tools_enabled else "text"
+    buffered = ""   # withheld: a possibly-split tag, or tool markup
+    sent = 0        # characters already yielded as deltas
+    hold = len(TOOL_CALL_OPEN) - 1
+    in_tool = False
+
+    try:
+        headers = glean_headers()
+    except HTTPException as exc:
+        yield ("error", str(exc.detail))
+        return
 
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             async with client.stream(
-                "POST", glean_url(), json=payload, headers=glean_headers()
+                "POST", glean_url(), json=payload, headers=headers
             ) as resp:
                 if resp.status_code in (401, 403):
                     yield ("error", "Glean session expired - re-run get_credentials.py")
@@ -721,38 +900,42 @@ async def _glean_events(payload: dict, tools_enabled: bool):
                         if not new:
                             continue
 
-                        if mode is None:
-                            buffered += new
-                            probe = buffered.lstrip()
-                            if len(probe) < len(TOOL_CALL_OPEN) and \
-                                    TOOL_CALL_OPEN.startswith(probe):
-                                continue  # still ambiguous
-                            if probe.startswith(TOOL_CALL_OPEN):
-                                mode = "tool"
-                                continue
-                            mode = "text"
-                            new, buffered = buffered, ""
-
-                        if mode == "text":
+                        if not tools_enabled:
+                            sent += len(new)
                             yield ("delta", new)
-                        else:
-                            buffered += new
+                            continue
+
+                        buffered += new
+                        if in_tool:
+                            continue
+
+                        idx = buffered.find(TOOL_CALL_OPEN)
+                        if idx >= 0:
+                            if idx:
+                                sent += idx
+                                yield ("delta", buffered[:idx])
+                            buffered = buffered[idx:]
+                            in_tool = True
+                            continue
+
+                        # Keep back enough characters that a tag split across
+                        # chunks is still recognisable on the next pass.
+                        if len(buffered) > hold:
+                            emit, buffered = buffered[:-hold], buffered[-hold:]
+                            sent += len(emit)
+                            yield ("delta", emit)
     except httpx.RequestError as exc:
         yield ("error", f"Glean unreachable: {exc}")
         return
 
-    yield ("final", delta.text, mode == "text")
-
-
-def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+    yield ("final", delta.text, delta.text[sent:])
 
 
 # --------------------------------------------------------------------------
 # OpenAI streaming
 # --------------------------------------------------------------------------
 
-async def _stream_openai(payload: dict, tools_enabled: bool):
+async def _stream_openai(payload: dict, tools_enabled: bool, model: str = "glean"):
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
     def chunk(delta: dict, finish=None) -> str:
@@ -760,31 +943,34 @@ async def _stream_openai(payload: dict, tools_enabled: bool):
             "id": cid,
             "object": "chat.completion.chunk",
             "created": int(time.time()),
-            "model": "glean",
+            "model": model or "glean",
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
         }
         return f"data: {json.dumps(data)}\n\n"
 
     role_sent = False
 
+    def text_delta(content: str) -> dict:
+        nonlocal role_sent
+        if role_sent:
+            return {"content": content}
+        role_sent = True
+        return {"role": "assistant", "content": content}
+
     async for event in _glean_events(payload, tools_enabled):
         kind = event[0]
 
         if kind == "error":
-            yield chunk({"role": "assistant", "content": f"[{event[1]}]"})
+            yield chunk(text_delta(f"[{event[1]}]"))
             yield chunk({}, "stop")
             yield "data: [DONE]\n\n"
             return
 
         if kind == "delta":
-            delta = {"content": event[1]}
-            if not role_sent:
-                delta = {"role": "assistant", "content": event[1]}
-                role_sent = True
-            yield chunk(delta)
+            yield chunk(text_delta(event[1]))
             continue
 
-        full, staged = event[1], event[2]
+        full, pending = event[1], event[2]
         calls = extract_tool_calls(full) if tools_enabled else []
 
         if calls:
@@ -793,8 +979,8 @@ async def _stream_openai(payload: dict, tools_enabled: bool):
             ]})
             yield chunk({}, "tool_calls")
         else:
-            if not staged:
-                yield chunk({"role": "assistant", "content": full})
+            if pending:
+                yield chunk(text_delta(pending))
             yield chunk({}, "stop")
 
         log.info("<- glean stream: %d chars, %d tool calls", len(full), len(calls))
@@ -949,7 +1135,7 @@ def _anthropic_message(text: str, calls: list, model: str, prompt_chars: int) ->
         "stop_reason": "tool_use" if calls else "end_turn",
         "stop_sequence": None,
         "usage": {
-            "input_tokens": _estimate_tokens("x" * prompt_chars),
+            "input_tokens": _estimate_tokens_from_chars(prompt_chars),
             "output_tokens": _estimate_tokens(text),
         },
     }
@@ -964,7 +1150,6 @@ async def _stream_anthropic(payload: dict, tools_enabled: bool, model: str, prom
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     index = 0
     text_open = False
-    staged_any = False
 
     def open_text(idx: int) -> str:
         return _sse("content_block_start", {
@@ -984,7 +1169,7 @@ async def _stream_anthropic(payload: dict, tools_enabled: bool, model: str, prom
             "stop_reason": None,
             "stop_sequence": None,
             "usage": {
-                "input_tokens": _estimate_tokens("x" * prompt_chars),
+                "input_tokens": _estimate_tokens_from_chars(prompt_chars),
                 "output_tokens": 0,
             },
         },
@@ -1015,7 +1200,6 @@ async def _stream_anthropic(payload: dict, tools_enabled: bool, model: str, prom
             if not text_open:
                 yield open_text(index)
                 text_open = True
-            staged_any = True
             yield _sse("content_block_delta", {
                 "type": "content_block_delta",
                 "index": index,
@@ -1023,21 +1207,19 @@ async def _stream_anthropic(payload: dict, tools_enabled: bool, model: str, prom
             })
             continue
 
-        full, staged = event[1], event[2]
+        full, pending = event[1], event[2]
         calls = extract_tool_calls(full) if tools_enabled else []
 
-        # Text buffered while deciding tool-vs-text still needs to be sent.
-        if not staged and not calls:
+        # Text withheld while deciding tool-vs-text still needs to be sent.
+        if pending and not calls:
             if not text_open:
                 yield open_text(index)
                 text_open = True
-            if full:
-                staged_any = True
-                yield _sse("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "text_delta", "text": full},
-                })
+            yield _sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "text_delta", "text": pending},
+            })
 
         if text_open:
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": index})
@@ -1084,20 +1266,23 @@ async def _stream_anthropic(payload: dict, tools_enabled: bool, model: str, prom
 @app.post("/v1/messages")
 async def messages(request: Request):
     """Anthropic-compatible endpoint so Claude Code can target this directly."""
+    _check_client_auth(request)
     body = await request.json()
     openai_messages, tools = anthropic_to_openai(body)
     stream = bool(body.get("stream"))
     model = body.get("model") or "glean"
 
+    choice = body.get("tool_choice")
+    if tools and isinstance(choice, dict) and choice.get("type") not in (None, "auto"):
+        log.info("tool_choice=%r is advisory: Glean has no native tool API", choice)
+
     payload = build_payload(openai_messages, tools, stream, body.get("model"))
     if not payload["messages"]:
         raise HTTPException(status_code=400, detail="No usable message content.")
+    # Before StreamingResponse: raising inside the generator truncates the stream.
+    _require_config()
 
-    prompt_chars = sum(
-        len(f.get("text", ""))
-        for m in payload["messages"]
-        for f in m.get("fragments", [])
-    )
+    prompt_chars = _prompt_chars(payload)
 
     log.info(
         "-> glean (anthropic): %d msgs, %d tools, stream=%s, model=%s",
@@ -1143,9 +1328,14 @@ async def messages(request: Request):
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
-    """Claude Code calls this before sending; an estimate is sufficient."""
+    """Claude Code calls this before sending; an estimate is sufficient.
+
+    Counted from the assembled payload rather than the raw messages, so the
+    injected HARNESS_PROMPT and TOOL_PROMPT are included: counting only the
+    client's own text understates the prompt by roughly a thousand tokens.
+    """
+    _check_client_auth(request)
     body = await request.json()
     openai_messages, tools = anthropic_to_openai(body)
-    total = sum(len(_text_of(m.get("content"))) for m in openai_messages)
-    total += sum(len(json.dumps(t)) for t in tools)
-    return {"input_tokens": _estimate_tokens("x" * total)}
+    payload = build_payload(openai_messages, tools, False, body.get("model"))
+    return {"input_tokens": _estimate_tokens_from_chars(_prompt_chars(payload))}
