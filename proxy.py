@@ -49,6 +49,13 @@ def _flag(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes")
 
 
+# Limits advertised to clients so they know when to condense a conversation.
+# Measured with tools/probe_context.py: a 600k-token prompt was preserved intact
+# and 800k returned HTTP 500, so 400k leaves headroom. Glean never truncated
+# silently in testing — it either kept the whole prompt or failed outright.
+CONTEXT_WINDOW = int(os.getenv("GLEAN_CONTEXT_WINDOW", "400000"))
+MAX_OUTPUT_TOKENS = int(os.getenv("GLEAN_MAX_OUTPUT_TOKENS", "8192"))
+
 # agentConfig mirrors what the Glean web app sends. Captured from a live
 # request, so these names are exact.
 #   agent       : ADVANCED (reasoning) or FAST
@@ -58,12 +65,6 @@ def _flag(name: str, default: str) -> bool:
 # Company tools default to OFF: with retrieval enabled Glean answers questions
 # about the user's code from its enterprise index, confidently describing a
 # different repository instead of calling a tool against the real machine.
-# Advisory limits reported to clients. Glean does not publish its real context
-# window, so these are configurable: lower them if long conversations start
-# failing, raise them if requests are being truncated client-side.
-CONTEXT_WINDOW = int(os.getenv("GLEAN_CONTEXT_WINDOW", "200000"))
-MAX_OUTPUT_TOKENS = int(os.getenv("GLEAN_MAX_OUTPUT_TOKENS", "8192"))
-
 GLEAN_AGENT = os.getenv("GLEAN_AGENT", "ADVANCED")
 GLEAN_MODEL_SET_ID = os.getenv("GLEAN_MODEL_SET_ID", "OPUS_5_MS")
 ENABLE_COMPANY_TOOLS = _flag("GLEAN_ENABLE_COMPANY_TOOLS", "false")

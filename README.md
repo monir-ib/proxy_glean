@@ -1,321 +1,330 @@
-# Glean Proxy
+# Glean Proxy for Kilo Code
 
-Turns your Glean web session into a local API that coding tools can use as a model —
-with **tool calling**, so Glean can run `grep`, read files, and execute commands on your
-machine through the harness.
+Use Glean as the model behind **Kilo Code** in VS Code, with working tool use — Glean can
+run `grep`, read files, and execute commands on your machine through Kilo Code.
 
-Speaks two dialects, so most tools work without a translation layer:
+It works by reusing your normal Glean browser login, so no admin console or API token is
+needed. A local server translates between Kilo Code's OpenAI-style requests and Glean's
+internal web API.
 
-| Endpoint | Dialect | Used by |
-|---|---|---|
-| `/v1/chat/completions` | OpenAI | Cursor, Continue.dev, Aider, most tools |
-| `/v1/messages` | Anthropic | Claude Code |
+---
 
-No admin console or API token needed — it reuses your normal browser login.
+## Setup
 
-## Quick start
+### 1. Install dependencies
 
-```bash
+```powershell
 pip install -r requirements.txt
-python -m playwright install chromium   # only if you have neither Edge nor Chrome
-
-python get_credentials.py               # opens a browser: log in, send one chat message
-python doctor.py                        # verify everything is healthy
-python -m uvicorn proxy:app --host 127.0.0.1 --port 8000
 ```
 
-`python -m` is used throughout because pip's `Scripts` directory is often missing from
-PATH on Windows, which makes bare `uvicorn` / `playwright` fail with "not recognized".
-
-The server keeps running in that terminal, so open a second one for your editor.
-
-## Connecting your tools
-
-### Claude Code
-
-Start the proxy in one terminal, then in a **second** terminal:
-
-PowerShell (Windows):
+If you have neither Edge nor Chrome installed, also run:
 
 ```powershell
-$env:ANTHROPIC_BASE_URL = "http://localhost:8000"
-$env:ANTHROPIC_API_KEY  = "dummy"
-claude
+python -m playwright install chromium
 ```
 
-bash / zsh (macOS, Linux):
+> `python -m` is used throughout because pip's `Scripts` folder is often missing from
+> PATH on Windows, which makes bare `uvicorn` or `playwright` fail with
+> "not recognized as the name of a cmdlet".
 
-```bash
-ANTHROPIC_BASE_URL=http://localhost:8000 ANTHROPIC_API_KEY=dummy claude
-```
-
-PowerShell has no inline `VAR=value cmd` form — using the bash version there leaves
-you at a `>>` continuation prompt (press Ctrl+C to escape).
-
-These variables last only for that shell session. To make them permanent on Windows:
+### 2. Capture your Glean session
 
 ```powershell
-setx ANTHROPIC_BASE_URL "http://localhost:8000"
-setx ANTHROPIC_API_KEY "dummy"
+python get_credentials.py
 ```
 
-No LiteLLM or other proxy required; `/v1/messages` is served natively, including
-streaming tool calls and `count_tokens`.
+A browser window opens on Glean. **Log in** (SSO is fine, take your time), then **send
+one chat message** such as "hello". The script captures your session and closes.
 
-**Glean does not appear in the model picker, and should not.** `ANTHROPIC_BASE_URL`
-redirects *all* of Claude Code's traffic to the proxy; the picker still lists the usual
-Claude models, but whichever is selected, the request is answered by Glean. The model
-name is ignored on purpose (see the model section below).
+Your login is saved in `.glean_profile/`, so later refreshes usually skip the login step.
 
-To confirm it is working, watch the proxy terminal while sending a message:
-
-```
--> glean (anthropic): 1 msgs, 14 tools, stream=True, model=OPUS_5_MS
-```
-
-Optional touches:
+### 3. Verify it works
 
 ```powershell
-$env:ANTHROPIC_MODEL = "glean"        # label the UI "glean"
-$env:ANTHROPIC_AUTH_TOKEN = "dummy"   # if requests never reach the proxy
+python doctor.py
 ```
 
-`/status` inside Claude Code shows which base URL it is really using.
+Every line should read `OK`. If anything fails, the doctor prints the exact command that
+fixes it. See [When something breaks](#when-something-breaks).
 
-### VS Code — Cline or Roo Code (recommended)
-
-These are the most reliable clients here, because they do **not** use OpenAI function
-calling: they describe their tools in the prompt and parse the reply themselves. That
-bypasses this proxy's tool-call emulation — the reply is just text — so there is one
-less probabilistic layer between Glean and your editor.
-
-**1. Start the proxy** in a terminal and leave it running:
+### 4. Start the proxy
 
 ```powershell
 python -m uvicorn proxy:app --host 127.0.0.1 --port 8000
 ```
 
-**2. Install Cline**: Extensions view (`Ctrl+Shift+X`) → search "Cline" → Install.
-Open it from the robot icon in the sidebar.
+**Leave this terminal open** — the server must keep running while you use Kilo Code. It
+logs every request, which is the quickest way to confirm Kilo Code is reaching it.
 
-**3. Configure it** via the gear icon in the Cline panel:
+### 5. Install Kilo Code
+
+In VS Code: Extensions (`Ctrl+Shift+X`) → search **Kilo Code** → Install. Open it from
+the Kilo icon in the sidebar.
+
+### 6. Point Kilo Code at the proxy
+
+Open **Settings** (gear icon) → **Providers** tab, scroll to the bottom and click
+**Custom provider**. Fill in:
 
 | Field | Value |
 |---|---|
-| API Provider | `OpenAI Compatible` |
+| Provider ID | `glean-proxy` |
+| Display name | `Glean Proxy` |
+| Provider API | `OpenAI Compatible` |
 | Base URL | `http://localhost:8000/v1` |
-| API Key | `dummy` (any non-empty string) |
-| Model ID | `glean` |
+| API key | `dummy` (any non-empty string; may also be left empty) |
+| Models | `glean` |
 
-Then expand the model options below and set:
+Kilo Code auto-fetches the model list from the proxy's `/v1/models`, so `glean` should
+appear on its own once the Base URL is entered — the proxy must be running for that.
+Submit, then pick **Glean Proxy → glean** in the model picker.
 
-| Field | Value |
-|---|---|
-| Context Window | `200000` |
-| Max Output Tokens | `8192` |
-| Supports Images | off |
-| Supports Browser Use / Computer Use | off |
-| Input / Output Price | `0` |
+Then set the context window in `kilo.json` — Kilo Code does **not** take it from the
+proxy. See [Setting the context window](#setting-the-context-window), which also covers
+turning tool use on. Without `tool_call: true`, Kilo Code will not let Glean edit files
+or run commands.
 
-Cline asks for these rather than reading `/v1/models`, so enter them by hand. They must
-match `GLEAN_CONTEXT_WINDOW` and `GLEAN_MAX_OUTPUT_TOKENS` in `.env`.
+This setup is text-only, so leave image and browser/computer-use options off.
 
-**4. Open a folder** in VS Code — Cline works against a workspace, and refuses to run
-without one.
+### 7. Open your project and run a task
 
-**5. Send a task**, e.g. *"list the files in this project"*. Cline proposes each command
-and waits for **Approve**. Read-only commands can be auto-approved in its settings.
+**File → Open Folder** and pick the project you want to work on. Kilo Code needs a
+workspace folder and will not run without one.
 
-Use **Act** mode for editing files and running commands; **Plan** mode only discusses.
-
-**6. Confirm it is reaching the proxy** — the proxy terminal should log:
+Give it a real task:
 
 ```
--> glean: 1 msgs, 0 tools, stream=True, model=OPUS_5_MS
+list the files in this project
 ```
 
-`0 tools` is correct here: Cline sends its tool instructions as prose, so this proxy's
-emulation stays out of the way.
-
-### Cursor / Continue.dev / Aider
-
-Provider **OpenAI**, base URL `http://localhost:8000/v1`, any dummy API key, model
-`glean`.
-
-Continue.dev (`~/.continue/config.json`):
-
-```json
-"models": [
-  {
-    "title": "Glean",
-    "provider": "openai",
-    "model": "glean",
-    "apiBase": "http://localhost:8000/v1",
-    "apiKey": "dummy"
-  }
-]
-```
-
-Continue.dev's agent mode and Cursor do use native tool calling, which goes through the
-emulation described under [Tool calling](#tool-calling).
-
-## Layout
+Kilo Code proposes a command and waits for approval. Click **Approve** and **let the
+command finish**. The proxy terminal should log something like:
 
 ```
-proxy.py              the server (both API dialects)
-get_credentials.py    capture/refresh your Glean session
-doctor.py             diagnose problems and print the fix
-tests/                test_translation.py (offline), test_e2e.py, test_anthropic.py
-tools/                probes and diagnostics for Glean's API
-.env                  your captured session (gitignored)
+-> glean: 1 msgs, 18 tools, stream=True, model=OPUS_5_MS
 ```
+
+That means Glean is answering. The tool count is non-zero because Kilo Code sends real
+OpenAI tool schemas — see [How tool use works](#how-tool-use-works).
+
+---
+
+## Using it day to day
+
+- The proxy must be running. If Kilo Code reports `ECONNREFUSED 127.0.0.1:8000`, start it.
+- Restart the proxy after editing `.env` — settings are read once at startup. This
+  matters most after refreshing your session.
+- Restarting mid-conversation is otherwise harmless; the proxy keeps no state.
+
+Two habits make a real difference:
+
+**Let commands finish.** Approving a command but not waiting for it returns no output.
+Starved of the data it asked for, Glean invents an explanation — commonly that it is
+"sandboxed" and cannot reach your files. Always let the command complete.
+
+**Give tasks, not greetings.** Opening with "hi" invites a conversational reply with no
+tool call in it, which is wasted turn. Start with something actionable.
+
+---
 
 ## When something breaks
 
-Run the doctor first — it names the problem and the command that fixes it:
+Start here — it names the problem and the fix:
 
-```bash
+```powershell
 python doctor.py              # full check
 python doctor.py --offline    # config only, no network
 ```
 
-It checks the `.env`, cookie contents, **session age** (decoded from the cookie),
-whether Glean still accepts the session, whether **Glean's frontend version has
-moved on**, whether a real chat request works, and whether the proxy is running.
+It checks your `.env`, the cookies, your **session age** (decoded from the cookie
+itself), whether Glean still accepts the session, whether **Glean's frontend version has
+moved on**, whether a real chat request succeeds, and whether the proxy is running.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `401`, or `[Glean session expired]` in a reply | Session expired (about weekly) | `python get_credentials.py` |
-| `500` from Glean on every request | `agentConfig` rejected, usually a bad `GLEAN_MODEL_SET_ID` | Set `GLEAN_MODEL_SET_ID=OPUS_5_MS`, or re-capture with `python tools/capture_payload.py` |
-| Answers describe files you do not have | Company retrieval or Glean's own sandbox | Ensure `GLEAN_ENABLE_COMPANY_TOOLS=false` |
+| `ECONNREFUSED 127.0.0.1:8000` in Kilo Code | Proxy not running | Start it (step 4) |
+| `401`, or `[Glean session expired]` in a reply | Session expired (roughly weekly) | `python get_credentials.py`, then restart the proxy |
+| `500` from Glean on every request | `agentConfig` rejected, usually a bad `GLEAN_MODEL_SET_ID` | Set `GLEAN_MODEL_SET_ID=OPUS_5_MS`, restart |
+| Replies mention being "sandboxed" or in a container | Glean's own shell tool confusing it, usually after empty command output | Let commands finish; keep `GLEAN_HARNESS_MODE=true` |
+| Answers describe files you do not have | Company retrieval, or Glean's internal sandbox | Keep `GLEAN_ENABLE_COMPANY_TOOLS=false` |
+| Greeted by name, or Glean features mentioned | Personalization leaking in | Keep `GLEAN_INCOGNITO_MODE=true` |
 | Replies are empty | Model set unavailable | Try `GLEAN_MODEL_SET_ID=OPUS_5_MS` |
 | Doctor warns the client version differs | Glean shipped a frontend update | Copy the version doctor prints into `GLEAN_CLIENT_VERSION` |
-| Browser closes before you can log in | — | Fixed; `get_credentials.py` waits up to 15 minutes and saves your login |
+| `glean` missing from Kilo Code's model picker | Proxy was down when Kilo fetched models, or the model was never added | Start the proxy, then **Edit provider** and add `glean` |
+| Kilo Code will not edit files or run commands | `tool_call` not set on the model | Add `"tool_call": true` in `kilo.json` |
+| Conversations grow until Glean returns `500` | `limit.context` unset, so compaction is disabled | Set `limit.context` in `kilo.json` |
 
-## Model, thinking mode, and sources
+---
 
-The proxy sends the same `agentConfig` the web app sends, so UI settings are available
-as configuration:
+## How tool use works
 
-```bash
-GLEAN_AGENT=ADVANCED               # ADVANCED (reasoning) or FAST
-GLEAN_MODEL_SET_ID=OPUS_5_MS       # model selection
-GLEAN_ENABLE_COMPANY_TOOLS=false   # company/enterprise retrieval
-GLEAN_ENABLE_WEB_SEARCH=false      # web search
-GLEAN_SAVE_CHAT=false              # keep proxy traffic out of your chat history
-```
+Kilo Code uses **native OpenAI function calling**: it sends its tool schemas in the
+`tools` parameter and expects `tool_calls` back. Glean's API has no usable `tools`
+parameter, so the proxy injects the schemas into the prompt and parses `<tool_call>`
+blocks out of the reply into a proper `tool_calls` response. This is the same path used
+by Continue.dev's agent mode and Cursor.
 
-Select a model per request with the `model` field, but **only Glean-style IDs**
-(`UPPER_SNAKE`, e.g. `OPUS_5_MS`) are honoured:
+The proxy also supports clients that define their own XML tool syntax in the system
+prompt and parse replies themselves. Those send **no** `tools` parameter, so nothing
+needs translating — Glean just has to follow the client's format, which
+`tools/test_cline_protocol.py` checks (3/3 on real tasks). An Anthropic-dialect endpoint
+(`/v1/messages`) is also served for tools that expect that shape.
 
-```json
-{"model": "OPUS_5_MS", "messages": [...]}
-```
-
-Client model names such as `claude-opus-4-5-20251101` or `gpt-4o` are deliberately
-ignored in favour of `GLEAN_MODEL_SET_ID`. Forwarding them made Glean reject the
-unknown value by **discarding the entire `agentConfig`**, which silently re-enabled
-company retrieval — tool calling dropped from 6/6 to 3/6 before this was fixed.
-
-### Keep company tools off for coding
-
-**`GLEAN_ENABLE_COMPANY_TOOLS=false` is load-bearing, not a preference.** With
-retrieval on, "Find every TODO comment in this repository" returned a confident answer
-citing `skills/create-skill/scripts/init_skill.py:118` — a file in some *other* indexed
-repo. A coding agent would take that as fact. With it off, the same request correctly
-produces `bash({"command": "grep -rn -E 'TODO' ."})`.
-
-Glean can fabricate local answers two ways:
-
-1. **Enterprise index** — fixed by `GLEAN_ENABLE_COMPANY_TOOLS=false`.
-2. **Its own server-side shell sandbox** — Glean has an internal `Shell` tool and will
-   describe *its* filesystem (`/home/user`, `.duckdb`, `tool_sdk.py`). No flag for this
-   is known; the injected tool prompt steers away from it.
-
-If a reply mentions files you do not recognise, suspect these before believing it.
-
-## Tool calling
-
-Glean's API has no usable `tools` parameter, so tool calling is emulated: schemas are
-injected into the prompt and Glean is asked to reply with
-
-```
-<tool_call>
-{"name": "bash", "arguments": {"command": "grep -rn TODO ."}}
-</tool_call>
-```
-
-which the proxy converts into a native OpenAI `tool_calls` or Anthropic `tool_use`
-response. The harness runs it locally and returns the output, which the proxy relays
-back to Glean as a user turn.
-
-The wording was tuned against the live API (`tools/tune_tools.py`), because Glean's
-persona otherwise replies "I can't access that":
-
-| framing | tool-call rate |
-|---|---|
-| firm ("you are the reasoning engine; never claim you lack access") | 3/3 |
-| plain tool listing | 2/3 |
-| few-shot examples | 0/3 — returned *empty* replies |
-
-Because adherence is prompt-based rather than enforced, it is probabilistic. The parser
-also accepts bare and fenced JSON as a fallback. Compare dialects with
-`python tools/compare_dialects.py`.
-
-### Staying in character
+### Keeping Glean in character
 
 Glean is an assistant with its own persona, not a bare model, so two settings keep it
-behaving like a backend:
+behaving like a backend. Both default to on.
 
-- **`GLEAN_HARNESS_MODE=true`** injects a short instruction to follow the client's format
-  and not greet the user, introduce itself, or mention Glean features. This matters most
-  for clients that send **no** `tools` parameter (Cline, Roo Code) — without it Glean gets
-  no instruction to stay in character and replies conversationally.
-- **`GLEAN_INCOGNITO_MODE=true`** sets the `incognitoMode` request field, suppressing
-  personalization that otherwise leaks in as greetings by name or references to your
+- **`GLEAN_HARNESS_MODE`** injects an instruction to follow the client's format, and
+  states that Glean has no shell or filesystem of its own and that command output comes
+  from your real machine. Without it, Glean answers as the Glean Assistant or claims it
+  is sandboxed.
+- **`GLEAN_INCOGNITO_MODE`** sets Glean's `incognitoMode` request field, suppressing the
+  personalization that otherwise appears as greetings by name or references to your
   documents.
 
-Check Cline-style protocol adherence with `python tools/test_cline_protocol.py`, which
-scores tool-tag usage and persona leakage with the harness prompt on and off.
+### Company retrieval must stay off
 
-Note that a bare "hi" is a poor first message for Cline: its protocol requires a tool
-call in every message, and a greeting invites a conversational reply. Give it a real
-task instead.
+**`GLEAN_ENABLE_COMPANY_TOOLS=false` is load-bearing, not a preference.** With retrieval
+on, "Find every TODO comment in this repository" returned a confident answer citing
+`skills/create-skill/scripts/init_skill.py:118` — a file in a *different* indexed repo.
+An agent would treat that as fact. With it off, the same request correctly produces
+`grep -rn -E 'TODO' .`.
 
-### Why not native tool calling?
+Glean can fabricate local answers two ways: its **enterprise index** (fixed by that
+setting) and its **own server-side Linux sandbox** (`/home/user`, `.duckdb`,
+`tool_sdk.py`), which the harness prompt steers it away from. If a reply mentions files
+you do not recognise, suspect these before believing it.
 
-The request has a `clientTools` field and the protocol has `TOOL_USE`, `TOOL_RESULT`,
-and `SERVER_TOOL` message types, so a native path exists — but it is not reachable:
-three plausible `clientTools` schemas returned opaque 500s and a fourth was accepted
-and ignored. Registering real tools appears to require admin-configured MCP servers or
-action packs. Re-check with `tools/probe_clienttools.py` and `tools/inspect_bundle.py`.
+---
 
-## Running on another machine (Linux VM, container, server)
+## Configuration (`.env`)
 
-The session cookie is a bearer credential and is **not tied to your device**, so:
+Written by `get_credentials.py`; edit by hand for the rest. Restart the proxy after any
+change.
 
-```bash
-# On the machine where you can log in (needs a GUI browser):
-python get_credentials.py
+| Variable | Purpose |
+|---|---|
+| `GLEAN_BACKEND_URL` | Tenant backend, e.g. `https://infoblox-be.glean.com` |
+| `GLEAN_COOKIE` | Session cookies (captured automatically) |
+| `GLEAN_EMAIL` | Sent as `X-Scio-Actas` |
+| `GLEAN_CLIENT_VERSION` | Glean frontend build string |
+| `GLEAN_REVERSE_MESSAGES` | Newest-first ordering; leave `true` |
+| `GLEAN_AGENT` | `ADVANCED` (reasoning) or `FAST` |
+| `GLEAN_MODEL_SET_ID` | Model, e.g. `OPUS_5_MS` |
+| `GLEAN_ENABLE_COMPANY_TOOLS` | Enterprise retrieval; keep `false` |
+| `GLEAN_ENABLE_WEB_SEARCH` | Web search, default `false` |
+| `GLEAN_SAVE_CHAT` | Save to your Glean chat history, default `false` |
+| `GLEAN_INCOGNITO_MODE` | Suppress personalization, default `true` |
+| `GLEAN_HARNESS_MODE` | Keep Glean acting as a backend model, default `true` |
+| `GLEAN_CONTEXT_WINDOW` | Context limit advertised on `/v1/models`, default `400000` |
+| `GLEAN_MAX_OUTPUT_TOKENS` | Output limit advertised, default `8192` |
+| `GLEAN_TIMEZONE_OFFSET` | Minutes, default `420` |
+| `GLEAN_TIMEOUT` | Upstream timeout in seconds, default `300` |
+| `LOG_LEVEL` | e.g. `DEBUG` |
 
-# Copy .env to the VM, then there:
-pip install -r requirements.txt
-python doctor.py
-python -m uvicorn proxy:app --host 127.0.0.1 --port 8000
+### Setting the context window
+
+Kilo Code **ignores** the limits the proxy advertises on `/v1/models`. It resolves them
+from its own config first, then from its bundled [models.dev](https://models.dev)
+snapshot, and `glean` is not in that catalog — so if you set nothing, `context` and
+`output` both resolve to `0`. That has real consequences: **compaction is disabled**, so
+conversations grow unbounded until Glean rejects the request, output silently falls back
+to Kilo's internal 32,000-token default, and context usage tracking stops working.
+
+So set them explicitly in `kilo.json`, using the provider ID you chose in step 6:
+
+```jsonc
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "model": "glean-proxy/glean",
+  "provider": {
+    "glean-proxy": {
+      "options": {
+        "baseURL": "http://localhost:8000/v1",
+        "apiKey": "dummy"
+      },
+      "models": {
+        "glean": {
+          "name": "Glean",
+          "tool_call": true,
+          "limit": {
+            "context": 400000,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
+}
 ```
 
-Notes:
+- **Global config** (recommended, and the only place `{env:VAR}` references resolve):
+  `C:\Users\<you>\.config\kilo\kilo.json`.
+- **Per project**: `kilo.json` in the workspace root.
 
-- `get_credentials.py` needs a real browser, so run it on your desktop and copy `.env`
-  over. Playwright is not needed on the VM at all.
-- The VM needs network access to your Glean backend host (VPN if applicable).
-- `.env` is a live credential: copy it over SSH/SCP rather than a shared drive, and
-  `chmod 600 .env`.
-- One session works from several machines at once; expiry is unchanged, and refreshing
-  means re-copying `.env`.
-- To serve other machines, bind `--host 0.0.0.0` — but the proxy has **no
-  authentication**, so anyone who can reach the port can use your Glean account. Prefer
-  an SSH tunnel: `ssh -L 8000:localhost:8000 user@vm`.
+`limit.context` is what Kilo Code compacts against; `limit.output` is sent upstream as
+`max_tokens`. There is also `limit.input`, for the case where a provider's input ceiling
+is lower than its full window — set it and compaction triggers against that instead.
+
+Keep the two sides roughly in step: `GLEAN_CONTEXT_WINDOW` in `.env` is what the proxy
+reports to any client that asks, and `limit.context` is what Kilo Code actually enforces.
+Raising one without the other just means Kilo Code and the proxy disagree. Restart the
+proxy after editing `.env`; reload the VS Code window after editing `kilo.json`.
+
+### About the measured limit
+
+Measured with `tools/probe_context.py`, which plants a marker at the start of a growing
+prompt and asks for it back:
+
+| prompt size | result |
+|---|---|
+| 200k tokens | marker kept |
+| 400k tokens | marker kept |
+| 600k tokens | marker kept |
+| 800k tokens | HTTP 500 |
+
+Glean never truncated silently — it either preserved the whole prompt or failed outright,
+which is the safer behaviour. The default of `400000` leaves headroom below the measured
+ceiling. Lower it if long sessions start failing.
+
+Selecting a model per request works only with Glean-style IDs (`UPPER_SNAKE`, e.g.
+`OPUS_5_MS`). Client model names like `gpt-4o` are ignored on purpose: forwarding them
+made Glean reject the value and discard the whole `agentConfig`, silently re-enabling
+company retrieval.
+
+---
+
+## Layout
+
+```
+proxy.py              the server
+get_credentials.py    capture/refresh your Glean session
+doctor.py             diagnose problems and print the fix
+tests/                automated tests (translation, live, Anthropic dialect)
+tools/                probes for Glean's API behaviour
+.env                  your captured session (gitignored)
+```
+
+## Diagnostics
+
+```powershell
+python doctor.py                        # start here
+python tests/test_translation.py        # offline unit tests, no network
+python tests/test_e2e.py                # live: streaming, tools, multi-turn
+python tools/test_cline_protocol.py     # does Glean obey a prompt-defined tool format?
+python tools/probe_context.py           # measure the context window
+python tools/probe_api.py               # raw request/response shape
+python tools/dump_stream.py             # confirm no stream content is dropped
+python tools/tune_tools.py              # score tool-call prompt wordings
+python tools/capture_payload.py         # capture payloads behind Glean UI settings
+python tools/inspect_bundle.py          # search Glean's frontend for API details
+python tools/discover_models.py         # hunt for available model IDs
+curl http://localhost:8000/health
+```
+
+`capture_payload.py` is the one to reach for when Glean's UI gains a setting you want:
+turn it on in the browser, send a prompt, and it prints the JSON fields that changed.
 
 ## Verified API behaviour
 
@@ -332,63 +341,37 @@ Established against the live API, not assumed:
 | Stream noise | `messageType` `UPDATE`/`CONTROL` carry no text; empty `{}` fragments occur |
 | `agentConfig` | `agent`, `modelSetId`, `toolSets.enableCompanyTools`, `toolSets.enableWebSearch` |
 | Other request fields | `incognitoMode`, `actionHints`, `agentId`, `inclusions.datasourceInstances` |
+| Effective context | at least 600k tokens; 800k returns HTTP 500 |
 | Built-in tools | `/api/v1/listtools` lists 18 server-side tools, including `Glean Search` and a `Shell` sandbox |
 
 Ordering matters more than it looks: sent chronologically, Glean replies to the *oldest*
 message, which reads as the model ignoring you rather than as a proxy bug.
 
-## Diagnostics
+## Running on another machine (Linux VM, container, server)
+
+The session cookie is a bearer credential and is **not tied to your device**:
 
 ```bash
-python doctor.py                      # start here
-python tests/test_translation.py      # offline unit tests, no network
-python tests/test_e2e.py              # live: OpenAI endpoint, streaming, tools
-python tests/test_anthropic.py        # live: Anthropic endpoint for Claude Code
-python tools/probe_api.py             # raw request/response shape
-python tools/probe_api.py --stream    # raw streaming format
-python tools/probe_api.py --order     # confirm message ordering
-python tools/dump_stream.py           # confirm no stream content is dropped
-python tools/tune_tools.py            # score tool-call prompt wordings
-python tools/compare_dialects.py      # tool-call rate, OpenAI vs Anthropic
-python tools/capture_payload.py       # capture payloads behind UI settings
-python tools/inspect_bundle.py        # search Glean's frontend for API details
-python tools/probe_clienttools.py     # re-test native clientTools support
-python tools/discover_models.py       # hunt for available model IDs
-curl http://localhost:8000/health
+# On your desktop, where a GUI browser exists:
+python get_credentials.py
+
+# Copy .env to the VM, then there:
+pip install -r requirements.txt
+python doctor.py
+python -m uvicorn proxy:app --host 127.0.0.1 --port 8000
 ```
 
-`capture_payload.py` is the tool to reach for when Glean's UI gains a setting you want:
-enable it in the browser, send a prompt, and it prints the JSON fields that changed.
-
-## Configuration (`.env`)
-
-| Variable | Purpose |
-|---|---|
-| `GLEAN_BACKEND_URL` | Tenant backend, e.g. `https://infoblox-be.glean.com` |
-| `GLEAN_COOKIE` | Session cookies (captured automatically) |
-| `GLEAN_EMAIL` | Sent as `X-Scio-Actas` |
-| `GLEAN_CLIENT_VERSION` | Frontend build string from the captured request |
-| `GLEAN_REVERSE_MESSAGES` | Newest-first ordering; `true` (leave it) |
-| `GLEAN_AGENT` | `ADVANCED` or `FAST` |
-| `GLEAN_MODEL_SET_ID` | Default model, e.g. `OPUS_5_MS` |
-| `GLEAN_ENABLE_COMPANY_TOOLS` | Enterprise retrieval; keep `false` for coding |
-| `GLEAN_ENABLE_WEB_SEARCH` | Web search, default `false` |
-| `GLEAN_SAVE_CHAT` | Save to Glean chat history, default `false` |
-| `GLEAN_INCOGNITO_MODE` | Suppress Glean personalization, default `true` |
-| `GLEAN_HARNESS_MODE` | Tell Glean to act as a backend model, default `true` |
-| `GLEAN_CONTEXT_WINDOW` | Advisory context limit in `/v1/models`, default `200000` |
-| `GLEAN_MAX_OUTPUT_TOKENS` | Advisory output limit, default `8192` |
-| `GLEAN_TIMEZONE_OFFSET` | Minutes, default `420` |
-| `GLEAN_TIMEOUT` | Upstream timeout in seconds, default `300` |
-| `LOG_LEVEL` | e.g. `DEBUG` |
-
-`GLEAN_CONTEXT_WINDOW` is advisory — Glean does not publish its real limit, so 200k is
-an estimate for an Opus-class model set. If long conversations start failing or replying
-oddly, lower it (try `128000`); clients use it to decide when to truncate.
+- Playwright is not needed on the VM; only `get_credentials.py` uses a browser.
+- The VM needs network access to your Glean backend host (VPN if applicable).
+- `.env` is a live credential: copy it over SSH/SCP, and `chmod 600 .env`.
+- One session works from several machines at once. Refreshing means re-copying `.env`.
+- To reach it from another machine, prefer an SSH tunnel
+  (`ssh -L 8000:localhost:8000 user@vm`). Binding `--host 0.0.0.0` exposes an endpoint
+  with **no authentication** — anyone who can reach the port can use your Glean account.
 
 ## Notes
 
-- `.env` holds live session cookies — anyone with them can act as you in Glean.
+- `.env` holds live session cookies; anyone with them can act as you in Glean.
 - This uses an internal endpoint with no stability guarantees, and web sessions may be
   rate-limited more aggressively than the official API.
 - Requests count as your Glean usage and are subject to your organisation's policies.
