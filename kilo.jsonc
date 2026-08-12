@@ -10,14 +10,17 @@
         "baseURL": "http://localhost:8000/v1"
       },
       "models": {
-        "glean": {
-          "name": "glean"
+        "claude-sonnet-5-fast": {
+          "name": "claude-sonnet-5-fast"
         },
-        "claude-sonnet-5": {
-          "name": "claude-sonnet-5"
+        "claude-sonnet-5-advanced": {
+          "name": "claude-sonnet-5-advanced"
         },
-        "claude-opus-5": {
-          "name": "claude-opus-5"
+        "claude-opus-5-fast": {
+          "name": "claude-opus-5-fast"
+        },
+        "claude-opus-5-advanced": {
+          "name": "claude-opus-5-advanced"
         }
       }
     }

@@ -264,24 +264,25 @@ def build_glean_messages(openai_messages: list, tools: list) -> list:
 
 GLEAN_MODEL_ID_RE = re.compile(r"^[A-Z0-9]+(?:_[A-Z0-9]+)*$")
 
-# Maps Claude model-name prefixes to Glean model-set IDs.  Dated variants
-# such as "claude-sonnet-5-20250514" match via startswith so only the base
-# prefix is needed.  Add entries here when Glean ships new model sets.
-_CLAUDE_TO_GLEAN: dict[str, str] = {
-    "claude-sonnet-5": "SONNET_5_MS",
-    "claude-opus-5": "OPUS_5_MS",
-    "claude-haiku-4-5": "HAIKU_4_5_MS",
-    "claude-fable-5": "FABLE_5_MS",
+# Each entry maps a Claude model-name prefix to (Glean modelSetId, agent mode).
+# agent mode is "FAST", "ADVANCED", or None to inherit the GLEAN_AGENT env default.
+# More-specific names (with a -fast/-advanced suffix) must come before the base
+# name so they match first in the loop.
+_CLAUDE_TO_GLEAN: dict[str, tuple[str, str | None]] = {
+    "claude-sonnet-5-fast":     ("SONNET_5_MS", "FAST"),
+    "claude-sonnet-5-advanced": ("SONNET_5_MS", "ADVANCED"),
+    "claude-opus-5-fast":       ("OPUS_5_MS", "FAST"),
+    "claude-opus-5-advanced":   ("OPUS_5_MS", "ADVANCED"),
 }
 
 
-def resolve_model_set(requested: str | None) -> str:
-    """Map a client's `model` field onto a Glean modelSetId.
+def resolve_model_set(requested: str | None) -> tuple[str, str]:
+    """Map a client's `model` field onto a (Glean modelSetId, agent mode) pair.
 
     Accepts Glean-style identifiers (UPPER_SNAKE, e.g. OPUS_5_MS) directly,
-    and also recognises Claude model names (e.g. "claude-sonnet-5") via the
-    _CLAUDE_TO_GLEAN table.  Anything else is ignored and the configured
-    default is used.
+    and also recognises Claude model names (e.g. "claude-sonnet-5-fast") via
+    the _CLAUDE_TO_GLEAN table.  Anything else falls back to the configured
+    defaults.
 
     Claude model names must NOT be forwarded verbatim: Glean rejects the
     unknown value by discarding the entire agentConfig, which silently
@@ -289,28 +290,29 @@ def resolve_model_set(requested: str | None) -> str:
     instead of calling tools.
     """
     if not requested:
-        return GLEAN_MODEL_SET_ID
+        return GLEAN_MODEL_SET_ID, GLEAN_AGENT
     name = requested.strip()
     for prefix in ("glean/", "glean:"):
         if name.lower().startswith(prefix):
             name = name[len(prefix):]
             break
     if not name or name.lower() == "glean":
-        return GLEAN_MODEL_SET_ID
+        return GLEAN_MODEL_SET_ID, GLEAN_AGENT
     if GLEAN_MODEL_ID_RE.match(name):
-        return name
+        return name, GLEAN_AGENT
     lower = name.lower()
-    for claude_prefix, glean_id in _CLAUDE_TO_GLEAN.items():
+    for claude_prefix, (glean_id, agent) in _CLAUDE_TO_GLEAN.items():
         if lower == claude_prefix or lower.startswith(claude_prefix + "-2"):
-            log.debug("mapping Claude model %r -> %s", requested, glean_id)
-            return glean_id
+            resolved_agent = agent or GLEAN_AGENT
+            log.debug("mapping Claude model %r -> %s / %s", requested, glean_id, resolved_agent)
+            return glean_id, resolved_agent
     log.debug("ignoring non-Glean model name %r; using %s", requested, GLEAN_MODEL_SET_ID)
-    return GLEAN_MODEL_SET_ID
+    return GLEAN_MODEL_SET_ID, GLEAN_AGENT
 
 
-def agent_config(model_set_id: str) -> dict:
+def agent_config(model_set_id: str, agent: str | None = None) -> dict:
     return {
-        "agent": GLEAN_AGENT,
+        "agent": agent or GLEAN_AGENT,
         "modelSetId": model_set_id,
         "toolSets": {
             "enableCompanyTools": ENABLE_COMPANY_TOOLS,
@@ -330,8 +332,8 @@ def agent_config(model_set_id: str) -> dict:
 
 def build_payload(openai_messages: list, tools: list, stream: bool, model: str | None) -> dict:
     """Assemble a Glean chat request mirroring the web client's shape."""
-    model_set_id = resolve_model_set(model)
-    config = agent_config(model_set_id)
+    model_set_id, agent = resolve_model_set(model)
+    config = agent_config(model_set_id, agent)
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000Z"
 
     messages = build_glean_messages(openai_messages, tools)
