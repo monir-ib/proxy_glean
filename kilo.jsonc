@@ -1,0 +1,31 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "disabled_providers": [],
+  "provider": {
+    "glean": {
+      "name": "glean",
+      "npm": "@ai-sdk/openai-compatible",
+      "limit": { "context": 400000, "output": 8192 },
+      "options": {
+        "baseURL": "http://localhost:8000/v1"
+      },
+      "models": {
+        "glean": {
+          "name": "glean"
+        },
+        "claude-sonnet-5": {
+          "name": "claude-sonnet-5"
+        },
+        "claude-opus-5": {
+          "name": "claude-opus-5"
+        }
+      }
+    }
+  },
+  "permission": {
+    "bash": "allow"
+  },
+  "indexing": {
+    "enabled": true
+  }
+}

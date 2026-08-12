@@ -264,15 +264,29 @@ def build_glean_messages(openai_messages: list, tools: list) -> list:
 
 GLEAN_MODEL_ID_RE = re.compile(r"^[A-Z0-9]+(?:_[A-Z0-9]+)*$")
 
+# Maps Claude model-name prefixes to Glean model-set IDs.  Dated variants
+# such as "claude-sonnet-5-20250514" match via startswith so only the base
+# prefix is needed.  Add entries here when Glean ships new model sets.
+_CLAUDE_TO_GLEAN: dict[str, str] = {
+    "claude-sonnet-5": "SONNET_5_MS",
+    "claude-opus-5": "OPUS_5_MS",
+    "claude-haiku-4-5": "HAIKU_4_5_MS",
+    "claude-fable-5": "FABLE_5_MS",
+}
+
 
 def resolve_model_set(requested: str | None) -> str:
     """Map a client's `model` field onto a Glean modelSetId.
 
-    Only Glean-style identifiers (UPPER_SNAKE, e.g. OPUS_5_MS) are accepted.
-    Client model names such as "claude-opus-4-5-20251101" or "gpt-4o" must NOT
-    be forwarded: Glean rejects the unknown value by discarding the entire
-    agentConfig, which silently re-enables company retrieval and makes it
-    answer about indexed repositories instead of calling tools.
+    Accepts Glean-style identifiers (UPPER_SNAKE, e.g. OPUS_5_MS) directly,
+    and also recognises Claude model names (e.g. "claude-sonnet-5") via the
+    _CLAUDE_TO_GLEAN table.  Anything else is ignored and the configured
+    default is used.
+
+    Claude model names must NOT be forwarded verbatim: Glean rejects the
+    unknown value by discarding the entire agentConfig, which silently
+    re-enables company retrieval and makes it answer about indexed repositories
+    instead of calling tools.
     """
     if not requested:
         return GLEAN_MODEL_SET_ID
@@ -285,6 +299,11 @@ def resolve_model_set(requested: str | None) -> str:
         return GLEAN_MODEL_SET_ID
     if GLEAN_MODEL_ID_RE.match(name):
         return name
+    lower = name.lower()
+    for claude_prefix, glean_id in _CLAUDE_TO_GLEAN.items():
+        if lower == claude_prefix or lower.startswith(claude_prefix + "-2"):
+            log.debug("mapping Claude model %r -> %s", requested, glean_id)
+            return glean_id
     log.debug("ignoring non-Glean model name %r; using %s", requested, GLEAN_MODEL_SET_ID)
     return GLEAN_MODEL_SET_ID
 
@@ -605,7 +624,10 @@ def _model_card(model_id: str = "glean") -> dict:
 
 @app.get("/v1/models")
 async def list_models():
-    return {"object": "list", "data": [_model_card()]}
+    models = [_model_card("glean")]
+    for claude_name in _CLAUDE_TO_GLEAN:
+        models.append(_model_card(claude_name))
+    return {"object": "list", "data": models}
 
 
 @app.get("/v1/models/{model_id}")
